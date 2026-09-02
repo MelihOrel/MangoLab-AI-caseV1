@@ -1,129 +1,172 @@
-# Case study — Junior Software Engineer at mangolab
+# fx-convert
 
-Two small tasks, **about two and a half hours in total.** Please do not spend
-your weekend on this. If you run out of time, stop and write down what you would
-have done next — that answer counts too.
-
-Use Claude Code, Cursor, Copilot — whatever you normally use. That is how we work
-every day, and we would rather see you use it well than watch you avoid it. The
-only thing we ask is that you know your own code.
-
-**Start by clicking "Use this template"** to create your own repository, then
-work there.
-
----
-
-## Part A — build (about 90 minutes)
-
-A small HTTP service — Python + FastAPI preferred, TypeScript is fine — with one
-endpoint an AI agent could call as a tool:
+One endpoint an agent can call as a tool. It converts an amount between two
+currencies at an ECB reference rate, and it will return an error rather than a
+number it cannot stand behind.
 
 ```
 GET /tools/convert?amount=250&from=EUR&to=TRY&date=2026-08-28
 ```
 
-It answers using the public [Frankfurter API](https://frankfurter.dev) —
-European Central Bank rates, no API key, no signup.
+## Run it
 
-### Three things are fixed, so that we can run every submission the same way
+```bash
+./run.sh                 # listens on $PORT, default 8080
+./test.sh                # 63 tests, no network
+```
 
-| | |
-|---|---|
-| Upstream URL | from the `FX_UPSTREAM_BASE` environment variable, defaulting to `https://api.frankfurter.dev`. **Nothing may hardcode the real host** — we point this at a fake upstream when reviewing. |
-| Port | from the `PORT` environment variable, default `8080` |
-| Scripts | `./run.sh` starts the service, `./test.sh` runs the tests. Both are in this template, unimplemented. |
+Both scripts create `.venv` on first use and install `requirements.txt`.
+Python 3.10+.
 
-### The response
+| variable | default | |
+|---|---|---|
+| `FX_UPSTREAM_BASE` | `https://api.frankfurter.dev` | Upstream base URL. The host appears nowhere else in the code. |
+| `FX_UPSTREAM_PREFIX` | `v1` | Path prefix under that base. See "one ambiguity" below. |
+| `PORT` | `8080` | |
+| `FX_UPSTREAM_TIMEOUT` | `4.0` | Seconds for one upstream call. |
 
-On success, 200 with:
+## The response
 
 ```json
 {
-  "amount": 250,
-  "from": "EUR",
-  "to": "TRY",
-  "rate": 47.1234,
-  "result": 11780.85,
-  "rate_date": "2026-08-28",
-  "asked_date": "2026-08-28",
-  "source": "ECB via frankfurter.dev"
+  "amount": 250, "from": "EUR", "to": "TRY",
+  "rate": 47.1234, "result": 11780.85,
+  "rate_date": "2026-08-28", "asked_date": "2026-08-30",
+  "source": "ECB via frankfurter.dev",
+  "rate_date_is_asked_date": false,
+  "note": "This rate is from 2026-08-28, not 2026-08-30: 2026-08-30 was a Sunday and the ECB publishes no rates at the weekend, so the most recent published rate before it was used (2 days earlier)."
 }
 ```
 
-`rate_date` is **the date the rate you used actually belongs to.** `asked_date`
-is what the caller asked for. They are not always the same, and that difference
-is the point of this task.
+The last two fields are additions to the shape in the brief. `rate_date`
+differing from `asked_date` already carries the information, but a model
+skimming a tool result can miss it, so there is one boolean to branch on and
+one sentence it can read to the customer verbatim. On an exact match the
+boolean is `true` and `note` is `null`.
 
-On failure, a non-2xx status and:
+`rate` is reported exactly as published — never rounded before being
+multiplied. `result` is `amount x rate` in decimal arithmetic (not binary
+floats), rounded half-up to 2 places.
+
+Errors are always:
 
 ```json
-{ "error": "<short_machine_code>", "message": "<a sentence a person could read>" }
+{ "error": "no_rate_available", "message": "The provider has no EUR to XBT rate for 2026-08-28. ..." }
 ```
 
-List your error codes in your README.
+## Error codes
 
-### The part that matters
+| code | HTTP | when |
+|---|---|---|
+| `missing_parameter` | 400 | `amount`, `from` or `to` was not supplied |
+| `invalid_amount` | 400 | not a number, `nan`/`inf`, zero, negative, or above 10^12 |
+| `invalid_currency` | 400 | not three letters |
+| `unknown_currency` | 400 | three letters, but the provider does not publish it |
+| `invalid_date` | 400 | not a real `YYYY-MM-DD` date |
+| `date_in_future` | 400 | after today (UTC) |
+| `date_before_series_start` | 400 | before 1999-01-04, when the ECB series begins |
+| `no_rate_available` | 404 | the provider has no rate for that pair on or before that day |
+| `upstream_timeout` | 504 | provider did not answer in time |
+| `upstream_unavailable` | 503 | provider could not be reached |
+| `upstream_error` | 502 | provider answered 5xx or another unexpected status |
+| `upstream_invalid_response` | 502 | body was not JSON, or failed a sanity check (below) |
+| `bad_request` / `not_found` / `method_not_allowed` | 4xx | malformed request, or an endpoint that does not exist |
+| `internal_error` | 500 | a bug in this service |
 
-The caller is a language model talking to a paying customer, so **a wrong number
-is worse than no number.** Decide — and implement — what happens when:
+## What it does in each case
 
-- the ECB published no rate for the date asked (weekends, holidays);
-- the date is in the future, or before the series starts;
-- the currency code does not exist, or `from` and `to` are the same;
-- the upstream is slow, returns 500, or returns something that is not JSON;
-- `amount` is missing, zero, negative, or has ten decimal places.
+**The ECB published no rate for the date asked (weekend, holiday).** It
+answers with the most recent rate published *on or before* that date and makes
+the substitution explicit: `rate_date` is the day the rate belongs to,
+`asked_date` is the day that was asked about, `rate_date_is_asked_date` is
+`false`, and `note` spells it out. The upstream is the source of truth for
+which day the rate belongs to — its `date` field is read and echoed, never the
+date we asked for. There is no cap on how far back the fallback reaches; the
+gap is stated in the note instead, in days.
 
-Your endpoint must never invent a rate, and must never present a rate as
-belonging to a date it does not belong to. Note that the upstream itself tells
-you which date its rates are from — read it. If you choose to answer with an
-earlier published rate, the response has to make that visible, because the model
-has to be able to tell the customer which day the number is from.
+There is no holiday calendar in this codebase. A weekend, Good Friday and a
+national closure all take the same path, because the upstream is the only
+thing that knows which days it published on. The single weekday-dependent
+piece is the wording of `note`: it names the day when the date asked about was
+a Saturday or Sunday, and otherwise says only that no rate was published —
+naming a holiday would require the calendar this service deliberately does not
+keep. Christmas 2025 is the case worth trying: asking for Sunday 2025-12-28
+answers with the rate from 2025-12-24, four days back across the closure.
 
-### Also required
+**The date is in the future.** `date_in_future`, refused before any upstream
+call. No rate exists for a day that has not happened, and answering with an
+older one would be presenting a rate as belonging to a date it does not.
 
-- **Tests that pass with no network at all** — fake the upstream. We run
-  `./test.sh` with `FX_UPSTREAM_BASE` pointing at a closed port.
-- A README of your own we can follow in under a minute: how to run it, how to
-  run the tests, your error codes, and what your endpoint does in each of the
-  cases above.
-- A repeat of the same question should not re-ask the upstream.
-- `NOTES.md`, one page. The skeleton is in this repo.
+**The date is before the series starts.** `date_before_series_start`, also
+without an upstream call.
 
-### Not required, not scored
+**The currency code does not exist.** Three letters is checked locally
+(`invalid_currency`). Existence is checked against the provider's own currency
+list, cached for a day, so a typo is `unknown_currency` with no rate lookup at
+all. If that list cannot be fetched the service does not fail — it falls
+through to the rate call, and a missing rate becomes `no_rate_available`.
 
-Auth, a database, a UI, a Dockerfile, CI, deployment, more endpoints. Adding them
-will not help you; a smaller thing done carefully will.
+**`from` and `to` are the same.** 200 with `rate: 1`, no upstream call. That
+is true on any day, including a Sunday, so no fallback applies. `source` says
+`identity (same currency, no rate needed)` rather than claiming the ECB
+published it.
 
----
+**The upstream is slow, 500s, or is not JSON.** `upstream_timeout` (504),
+`upstream_unavailable` (503), `upstream_error` (502),
+`upstream_invalid_response` (502). No retries: an agent is holding a customer
+on the line, so a fast honest failure beats a slow one, and the agent can
+decide whether to retry.
 
-## Part B — review (about 45 minutes)
+**`amount` is missing, zero, negative, or has ten decimal places.** Missing is
+`missing_parameter`. Zero is refused — a zero conversion is almost always a
+model that lost the number, and returning `0.00` would confirm that mistake to
+a customer. Negative is refused. Ten decimal places is *accepted*: it is a real
+question, parsed as a decimal, and the result is rounded to 2 places at the end.
 
-`tool.py` in this repository is a working version of the same service, written
-quickly with an AI assistant. It runs. **Review it as if it were going live
-tomorrow for a customer who pays us.**
+## What is checked before a number is returned
 
-Fill in `REVIEW.md`, one page:
+A wrong number is worse than no number, so the upstream's answer is not taken
+on trust. Any of these produces an error instead of a figure:
 
-- what is wrong, and what it does to a **customer** — not to a linter;
-- how you would verify each finding;
-- your findings **ranked**, and which single one you would fix before shipping
-  tonight.
+- the rate is not a finite number, or is zero or negative;
+- the response does not say which day the rate belongs to;
+- the response says it is based on a different currency than the one asked for
+  (a provider that ignores `base` would otherwise return a plausible, wrong
+  number);
+- the rate is dated *after* the day asked about;
+- the rate is dated before the ECB series begins.
 
-Fewer findings, ranked and explained, beat a long list. If something looks
-suspicious but is actually fine, saying so is worth as much as finding a real
-defect.
+## Caching
 
----
+Keyed on (from, to, day) — including the day, so a cached rate can never be
+served for a different date. Rates for a settled day never change and are held
+for 24 hours; today's rate is held for 10 minutes, because the ECB publishes
+around 16:00 CET and the answer can change. In-process, bounded at 1024
+entries. The currency list is fetched once a day.
 
-## Submitting
+## Tests
 
-Reply to our email with a link to your repository. Commit in small steps — the
-history is part of what we read. Five days is plenty; if you need more, just say
-so.
+`./test.sh` runs 63 tests. Every upstream call goes through
+`httpx.MockTransport`, so no socket is ever opened — the client code, URL
+building, JSON parsing and sanity checks all run, but the bytes come from
+`tests/conftest.py`. `test.sh` sets `FX_UPSTREAM_BASE` to a closed port so
+that a regression which reaches the network fails loudly.
 
-Any question about this brief, ask. An unclear requirement is our fault, not a
-test.
+One test greps `app/` to assert the real hostname appears only in
+`config.py`.
 
----
+## One ambiguity, and how I resolved it
 
-<sub>mangolab — Mango Yazılım Teknolojileri Ltd. Şti. · [mangolab.ai/careers](https://mangolab.ai/careers)</sub>
+The brief fixes the upstream *base* as `https://api.frankfurter.dev`, but the
+API's endpoints live under `/v1` (`/v1/2026-08-28`). So it is not clear whether
+a fake upstream will serve `/v1/2026-08-28` or `/2026-08-28`. I default to
+`/v1`, matching the real API, and made the prefix its own environment variable:
+`FX_UPSTREAM_PREFIX=""` drops it. Happy to change the default.
+
+## Deliberately not here
+
+No auth, database, UI, Dockerfile, CI, or extra endpoints — not even
+`/health`, since the brief said extra endpoints are not scored.
+
+Windows: `run.sh` and `test.sh` are bash; use Git Bash or WSL, or run
+`python -m uvicorn app.main:app --port 8080` and `python -m pytest` directly.
